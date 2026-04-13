@@ -94,6 +94,27 @@ namespace ICSharpCode.AvalonEdit.Editing
 		}
 		#endregion
 
+		/// <summary>
+		/// Gets whether an IME composition is currently active.
+		/// </summary>
+		public bool IsImeCompositionActive {
+			get { return ime != null && ime.IsCompositionActive; }
+		}
+
+		/// <summary>
+		/// Gets the start offset of the active IME composition, or -1 if there is no active composition text.
+		/// </summary>
+		public int ImeCompositionStartOffset {
+			get { return ime != null ? ime.CompositionStartOffset : -1; }
+		}
+
+		/// <summary>
+		/// Gets the length of the active IME composition text.
+		/// </summary>
+		public int ImeCompositionLength {
+			get { return ime != null ? ime.CompositionLength : 0; }
+		}
+
 		#region InputHandler management
 		/// <summary>
 		/// Gets the default input handler.

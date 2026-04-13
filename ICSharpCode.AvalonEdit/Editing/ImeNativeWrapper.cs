@@ -19,6 +19,7 @@
 using System;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media.TextFormatting;
@@ -79,9 +80,15 @@ namespace ICSharpCode.AvalonEdit.Editing
 		const int CPS_CANCEL = 0x4;
 		const int NI_COMPOSITIONSTR = 0x15;
 		const int GCS_COMPSTR = 0x0008;
+		const int GCS_COMPATTR = 0x0010;
+		const int GCS_CURSORPOS = 0x0080;
+		const int GCS_DELTASTART = 0x0100;
+		const int GCS_RESULTSTR = 0x0800;
 
 		public const int WM_IME_COMPOSITION = 0x10F;
+		public const int WM_IME_ENDCOMPOSITION = 0x10E;
 		public const int WM_IME_SETCONTEXT = 0x281;
+		public const int WM_IME_STARTCOMPOSITION = 0x10D;
 		public const int WM_INPUTLANGCHANGE = 0x51;
 
 		[DllImport("imm32.dll")]
@@ -105,6 +112,16 @@ namespace ICSharpCode.AvalonEdit.Editing
 		[DllImport("imm32.dll")]
 		[return: MarshalAs(UnmanagedType.Bool)]
 		static extern bool ImmGetCompositionFont(IntPtr hIMC, out LOGFONT font);
+		[DllImport("imm32.dll")]
+		[return: MarshalAs(UnmanagedType.Bool)]
+		static extern bool ImmGetConversionStatus(IntPtr hIMC, out int conversion, out int sentence);
+		[DllImport("imm32.dll")]
+		[return: MarshalAs(UnmanagedType.Bool)]
+		static extern bool ImmSetConversionStatus(IntPtr hIMC, int conversion, int sentence);
+		[DllImport("imm32.dll", EntryPoint = "ImmGetCompositionStringW", CharSet = CharSet.Unicode)]
+		static extern int ImmGetCompositionString(IntPtr hIMC, int dwIndex, IntPtr lpBuf, int dwBufLen);
+		[DllImport("imm32.dll", EntryPoint = "ImmGetCompositionStringW", CharSet = CharSet.Unicode)]
+		static extern int ImmGetCompositionString(IntPtr hIMC, int dwIndex, byte[] lpBuf, int dwBufLen);
 
 		[DllImport("msctf.dll")]
 		static extern int TF_CreateThreadMgr(out ITfThreadMgr threadMgr);
@@ -133,6 +150,66 @@ namespace ICSharpCode.AvalonEdit.Editing
 			return ImmNotifyIME(hIMC, NI_COMPOSITIONSTR, CPS_CANCEL);
 		}
 
+		public static bool GetConversionStatus(IntPtr hIMC, out int conversion, out int sentence)
+		{
+			return ImmGetConversionStatus(hIMC, out conversion, out sentence);
+		}
+
+		public static bool SetConversionStatus(IntPtr hIMC, int conversion, int sentence)
+		{
+			return ImmSetConversionStatus(hIMC, conversion, sentence);
+		}
+
+		public static ImeCompositionData GetCompositionData(IntPtr hIMC, IntPtr lParam)
+		{
+			int flags = unchecked((int)lParam.ToInt64());
+			ImeCompositionData data = new ImeCompositionData();
+
+			if ((flags & GCS_RESULTSTR) != 0)
+				data.Result = GetCompositionString(hIMC, GCS_RESULTSTR);
+
+			if ((flags & GCS_COMPSTR) != 0) {
+				data.HasCompositionString = true;
+				data.Composition = GetCompositionString(hIMC, GCS_COMPSTR) ?? string.Empty;
+			}
+
+			if ((flags & GCS_CURSORPOS) != 0)
+				data.CursorPosition = Math.Max(0, ImmGetCompositionString(hIMC, GCS_CURSORPOS, IntPtr.Zero, 0));
+
+			if ((flags & GCS_DELTASTART) != 0)
+				data.DeltaStart = Math.Max(0, ImmGetCompositionString(hIMC, GCS_DELTASTART, IntPtr.Zero, 0));
+
+			if ((flags & GCS_COMPATTR) != 0)
+				data.Attributes = GetCompositionBytes(hIMC, GCS_COMPATTR);
+
+			return data;
+		}
+
+		static string GetCompositionString(IntPtr hIMC, int dwIndex)
+		{
+			byte[] bytes = GetCompositionBytes(hIMC, dwIndex);
+			return bytes != null ? Encoding.Unicode.GetString(bytes) : null;
+		}
+
+		static byte[] GetCompositionBytes(IntPtr hIMC, int dwIndex)
+		{
+			int size = ImmGetCompositionString(hIMC, dwIndex, IntPtr.Zero, 0);
+			if (size <= 0)
+				return null;
+
+			byte[] bytes = new byte[size];
+			int copied = ImmGetCompositionString(hIMC, dwIndex, bytes, size);
+			if (copied <= 0)
+				return null;
+
+			if (copied == bytes.Length)
+				return bytes;
+
+			byte[] resized = new byte[copied];
+			Array.Copy(bytes, resized, copied);
+			return resized;
+		}
+
 		public static bool SetCompositionWindow(HwndSource source, IntPtr hIMC, TextArea textArea)
 		{
 			if (textArea == null)
@@ -154,10 +231,14 @@ namespace ICSharpCode.AvalonEdit.Editing
 		{
 			if (textArea == null)
 				throw new ArgumentNullException("textArea");
+
+			double factor = source.CompositionTarget?.TransformToDevice.M22 ?? 1.0;
+			int gdiHeight = -(int)Math.Round(textArea.FontSize * factor);
+
 			LOGFONT lf = new LOGFONT();
-			Rect characterBounds = textArea.TextView.GetCharacterBounds(textArea.Caret.Position, source);
-			lf.lfFaceName = textArea.FontFamily.Source;
-			lf.lfHeight = (int)characterBounds.Height;
+			lf.lfFaceName = textArea.FontFamily?.Source ?? "Microsoft YaHei";
+			lf.lfHeight = gdiHeight;
+			lf.lfQuality = 5; // ClearType
 			return ImmSetCompositionFont(hIMC, ref lf);
 		}
 

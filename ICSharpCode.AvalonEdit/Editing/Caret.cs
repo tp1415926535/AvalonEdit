@@ -484,6 +484,15 @@ namespace ICSharpCode.AvalonEdit.Editing
 				VisualLine visualLine = textView.GetVisualLine(position.Line);
 				if (visualLine != null) {
 					Rect caretRect = this.textArea.OverstrikeMode ? CalcCaretOverstrikeRectangle(visualLine) : CalcCaretRectangle(visualLine);
+					if (textArea.ime.IsCompositionActive) {
+						if (hasWin32Caret) {
+							Win32.DestroyCaret();
+							hasWin32Caret = false;
+						}
+						caretAdorner.Hide();
+						textArea.ime.UpdateCompositionWindow();
+						return;
+					}
 					// Create Win32 caret so that Windows knows where our managed caret is. This is necessary for
 					// features like 'Follow text editing' in the Windows Magnifier.
 					if (!hasWin32Caret) {

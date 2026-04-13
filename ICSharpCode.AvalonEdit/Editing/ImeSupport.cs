@@ -18,27 +18,38 @@
 
 using System;
 using System.ComponentModel;
+using System.Globalization;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Interop;
+
+using ICSharpCode.AvalonEdit.Document;
+using ICSharpCode.AvalonEdit.Rendering;
 
 namespace ICSharpCode.AvalonEdit.Editing
 {
 	class ImeSupport
 	{
 		readonly TextArea textArea;
+		readonly ImeCompositionLayer compositionLayer;
 		IntPtr currentContext;
 		IntPtr previousContext;
 		IntPtr defaultImeWnd;
 		HwndSource hwndSource;
 		EventHandler requerySuggestedHandler; // we need to keep the event handler instance alive because CommandManager.RequerySuggested uses weak references
 		bool isReadOnly;
+		bool isCompositionActive;
+		int compositionStartOffset = -1;
+		int compositionLength;
+		bool undoGroupOpen;
 
 		public ImeSupport(TextArea textArea)
 		{
 			if (textArea == null)
 				throw new ArgumentNullException("textArea");
 			this.textArea = textArea;
+			compositionLayer = new ImeCompositionLayer(textArea);
+			textArea.TextView.InsertLayer(compositionLayer, KnownLayer.Caret, LayerInsertionPosition.Below);
 			InputMethod.SetIsInputMethodSuspended(this.textArea, textArea.Options.EnableImeSupport);
 			// We listen to CommandManager.RequerySuggested for both caret offset changes and changes to the set of read-only sections.
 			// This is because there's no dedicated event for read-only section changes; but RequerySuggested needs to be raised anyways
@@ -61,6 +72,18 @@ namespace ICSharpCode.AvalonEdit.Editing
 			}
 		}
 
+		internal bool IsCompositionActive {
+			get { return isCompositionActive; }
+		}
+
+		internal int CompositionStartOffset {
+			get { return compositionStartOffset; }
+		}
+
+		internal int CompositionLength {
+			get { return compositionLength; }
+		}
+
 		public void OnGotKeyboardFocus(KeyboardFocusChangedEventArgs e)
 		{
 			UpdateImeEnabled();
@@ -68,9 +91,25 @@ namespace ICSharpCode.AvalonEdit.Editing
 
 		public void OnLostKeyboardFocus(KeyboardFocusChangedEventArgs e)
 		{
-			if (e.OldFocus == textArea && currentContext != IntPtr.Zero)
-				ImeNativeWrapper.NotifyIme(currentContext);
+			if (e.OldFocus == textArea && currentContext != IntPtr.Zero) {
+				if (UseInlineComposition) {
+					NotifyImePreservingConversionStatus();
+				} else {
+					ImeNativeWrapper.NotifyIme(currentContext);
+				}
+			}
+			SetCompositionActive(false);
 			ClearContext();
+		}
+
+		void NotifyImePreservingConversionStatus()
+		{
+			int conversion;
+			int sentence;
+			bool hasStatus = ImeNativeWrapper.GetConversionStatus(currentContext, out conversion, out sentence);
+			ImeNativeWrapper.NotifyIme(currentContext);
+			if (hasStatus)
+				ImeNativeWrapper.SetConversionStatus(currentContext, conversion, sentence);
 		}
 
 		void UpdateImeEnabled()
@@ -116,7 +155,7 @@ namespace ICSharpCode.AvalonEdit.Editing
 
 				var threadMgr = ImeNativeWrapper.GetTextFrameworkThreadManager();
 				if (threadMgr != null) {
-					// Even though the docs says passing null is invalid, this seems to help
+					// Even though the docu says passing null is invalid, this seems to help
 					// activating the IME on the default input context that is shared with WPF
 					threadMgr.SetFocus(IntPtr.Zero);
 				}
@@ -136,15 +175,162 @@ namespace ICSharpCode.AvalonEdit.Editing
 						CreateContext();
 					}
 					break;
-				case ImeNativeWrapper.WM_IME_COMPOSITION:
+				case ImeNativeWrapper.WM_IME_STARTCOMPOSITION:
+					if (UseInlineComposition) {
+						SetCompositionActive(true);
+						FinishDocumentComposition();
+						handled = true;
+					}
 					UpdateCompositionWindow();
+					break;
+				case ImeNativeWrapper.WM_IME_COMPOSITION:
+					if (UseInlineComposition && HandleComposition(lParam))
+						handled = true;
+					else
+						UpdateCompositionWindow();
+					break;
+				case ImeNativeWrapper.WM_IME_ENDCOMPOSITION:
+					SetCompositionActive(false);
+					if (UseInlineComposition)
+						handled = true;
 					break;
 			}
 			return IntPtr.Zero;
 		}
 
+		bool UseInlineComposition {
+			get {
+				CultureInfo inputLanguage = InputLanguageManager.Current.CurrentInputLanguage;
+				return inputLanguage != null && string.Equals(inputLanguage.TwoLetterISOLanguageName, "ko", StringComparison.OrdinalIgnoreCase);
+			}
+		}
+
+		bool HandleComposition(IntPtr lParam)
+		{
+			if (currentContext == IntPtr.Zero || textArea.Document == null)
+				return false;
+
+			ImeCompositionData composition = ImeNativeWrapper.GetCompositionData(currentContext, lParam);
+			if (composition == null)
+				return false;
+
+			if (!string.IsNullOrEmpty(composition.Result)) {
+				CommitDocumentComposition(composition.Result);
+			}
+
+			if (composition.HasCompositionString) {
+				if (!string.IsNullOrEmpty(composition.Composition)) {
+					SetCompositionActive(true);
+					UpdateDocumentComposition(composition.Composition, composition.CursorPosition);
+				} else {
+					CancelDocumentComposition();
+				}
+			}
+
+			UpdateCompositionWindow();
+			return !string.IsNullOrEmpty(composition.Result) || composition.HasCompositionString;
+		}
+
+		void SetCompositionActive(bool value)
+		{
+			if (isCompositionActive != value) {
+				isCompositionActive = value;
+				textArea.Caret.UpdateIfVisible();
+				if (!value)
+					FinishDocumentComposition();
+			}
+		}
+
+		void UpdateDocumentComposition(string text, int caretOffset)
+		{
+			if (compositionStartOffset < 0) {
+				StartUndoGroup();
+				compositionStartOffset = GetCompositionStartOffset();
+				compositionLength = text.Length;
+				textArea.ReplaceSelectionWithText(text);
+			} else {
+				int oldLength = compositionLength;
+				compositionLength = text.Length;
+				textArea.Document.Replace(compositionStartOffset, oldLength, text, OffsetChangeMappingType.CharacterReplace);
+			}
+
+			int normalizedCaretOffset = NormalizeCompositionCaretOffset(text, caretOffset);
+			textArea.Caret.Offset = compositionStartOffset + normalizedCaretOffset;
+			textArea.ClearSelection();
+			compositionLayer.SetCompositionSegment(compositionStartOffset, compositionLength, normalizedCaretOffset);
+		}
+
+		int GetCompositionStartOffset()
+		{
+			ISegment selectionSegment = textArea.Selection.SurroundingSegment;
+			if (selectionSegment != null)
+				return selectionSegment.Offset;
+			return textArea.Caret.Offset;
+		}
+
+		static int NormalizeCompositionCaretOffset(string text, int caretOffset)
+		{
+			int textLength = text != null ? text.Length : 0;
+			if (caretOffset <= 0)
+				return textLength;
+			return Math.Min(caretOffset, textLength);
+		}
+
+		void CommitDocumentComposition(string result)
+		{
+			if (compositionStartOffset >= 0) {
+				textArea.Selection = Selection.Create(textArea, compositionStartOffset, compositionStartOffset + compositionLength);
+				ClearDocumentCompositionState();
+				textArea.PerformTextInput(result);
+				EndUndoGroup();
+			} else {
+				textArea.PerformTextInput(result);
+			}
+		}
+
+		void CancelDocumentComposition()
+		{
+			if (compositionStartOffset >= 0 && textArea.Document != null) {
+				textArea.Document.Remove(compositionStartOffset, compositionLength);
+				textArea.Caret.Offset = compositionStartOffset;
+			}
+			ClearDocumentCompositionState();
+			EndUndoGroup();
+		}
+
+		void FinishDocumentComposition()
+		{
+			ClearDocumentCompositionState();
+			EndUndoGroup();
+		}
+
+		void ClearDocumentCompositionState()
+		{
+			compositionLayer.Clear();
+			compositionStartOffset = -1;
+			compositionLength = 0;
+		}
+
+		void StartUndoGroup()
+		{
+			if (!undoGroupOpen && textArea.Document != null) {
+				textArea.Document.UndoStack.StartUndoGroup();
+				undoGroupOpen = true;
+			}
+		}
+
+		void EndUndoGroup()
+		{
+			if (undoGroupOpen && textArea.Document != null) {
+				textArea.Document.UndoStack.EndUndoGroup();
+				undoGroupOpen = false;
+			}
+		}
+
 		public void UpdateCompositionWindow()
 		{
+			if (UseInlineComposition && isCompositionActive)
+				return;
 			if (currentContext != IntPtr.Zero) {
 				ImeNativeWrapper.SetCompositionFont(hwndSource, currentContext, textArea);
 				ImeNativeWrapper.SetCompositionWindow(hwndSource, currentContext, textArea);
