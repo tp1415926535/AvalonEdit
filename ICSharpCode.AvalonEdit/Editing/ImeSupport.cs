@@ -42,6 +42,7 @@ namespace ICSharpCode.AvalonEdit.Editing
 		int compositionStartOffset = -1;
 		int compositionLength;
 		bool undoGroupOpen;
+		string pendingTextInputSuppression;
 
 		public ImeSupport(TextArea textArea)
 		{
@@ -84,6 +85,16 @@ namespace ICSharpCode.AvalonEdit.Editing
 			get { return compositionLength; }
 		}
 
+		internal bool ShouldSuppressTextInput(string text)
+		{
+			if (string.IsNullOrEmpty(pendingTextInputSuppression))
+				return false;
+
+			string suppressedText = pendingTextInputSuppression;
+			pendingTextInputSuppression = null;
+			return string.Equals(suppressedText, text, StringComparison.Ordinal);
+		}
+
 		public void OnGotKeyboardFocus(KeyboardFocusChangedEventArgs e)
 		{
 			UpdateImeEnabled();
@@ -99,6 +110,8 @@ namespace ICSharpCode.AvalonEdit.Editing
 				}
 			}
 			SetCompositionActive(false);
+			if (compositionStartOffset >= 0 || undoGroupOpen)
+				FinishDocumentComposition();
 			ClearContext();
 		}
 
@@ -190,7 +203,7 @@ namespace ICSharpCode.AvalonEdit.Editing
 						UpdateCompositionWindow();
 					break;
 				case ImeNativeWrapper.WM_IME_ENDCOMPOSITION:
-					SetCompositionActive(false);
+					SetCompositionActive(false, UseInlineComposition);
 					if (UseInlineComposition)
 						handled = true;
 					break;
@@ -214,29 +227,67 @@ namespace ICSharpCode.AvalonEdit.Editing
 			if (composition == null)
 				return false;
 
-			if (!string.IsNullOrEmpty(composition.Result)) {
-				CommitDocumentComposition(composition.Result);
+			string result = composition.Result;
+			bool hasResult = !string.IsNullOrEmpty(result);
+			if (hasResult) {
+				CommitDocumentComposition(result);
 			}
 
 			if (composition.HasCompositionString) {
 				if (!string.IsNullOrEmpty(composition.Composition)) {
-					SetCompositionActive(true);
-					UpdateDocumentComposition(composition.Composition, composition.CursorPosition);
+					string compositionText = composition.Composition;
+					int caretOffset = composition.CursorPosition;
+					int overlapLength = GetCommittedOverlapLength(result, compositionText, composition.DeltaStart);
+					if (overlapLength > 0) {
+						compositionText = compositionText.Substring(overlapLength);
+						caretOffset = Math.Max(0, caretOffset - overlapLength);
+					}
+
+					if (!string.IsNullOrEmpty(compositionText)) {
+						SetCompositionActive(true);
+						UpdateDocumentComposition(compositionText, caretOffset);
+					}
 				} else {
 					CancelDocumentComposition();
 				}
 			}
 
 			UpdateCompositionWindow();
-			return !string.IsNullOrEmpty(composition.Result) || composition.HasCompositionString;
+			return hasResult || composition.HasCompositionString;
 		}
 
-		void SetCompositionActive(bool value)
+		static int GetCommittedOverlapLength(string result, string composition, int deltaStart)
+		{
+			if (string.IsNullOrEmpty(result) || string.IsNullOrEmpty(composition))
+				return 0;
+
+			int overlapLength = 0;
+			int maxOverlap = Math.Min(result.Length, composition.Length);
+			for (int length = maxOverlap; length > 0; length--) {
+				if (result.EndsWith(composition.Substring(0, length), StringComparison.Ordinal)) {
+					overlapLength = length;
+					break;
+				}
+			}
+
+			if (overlapLength == 0)
+				return 0;
+
+			if (deltaStart > overlapLength && deltaStart <= composition.Length) {
+				string changedPrefix = composition.Substring(0, deltaStart);
+				if (result.EndsWith(changedPrefix, StringComparison.Ordinal))
+					return deltaStart;
+			}
+
+			return overlapLength;
+		}
+
+		void SetCompositionActive(bool value, bool keepDocumentComposition = false)
 		{
 			if (isCompositionActive != value) {
 				isCompositionActive = value;
 				textArea.Caret.UpdateIfVisible();
-				if (!value)
+				if (!value && !keepDocumentComposition)
 					FinishDocumentComposition();
 			}
 		}
@@ -249,7 +300,9 @@ namespace ICSharpCode.AvalonEdit.Editing
 				compositionLength = text.Length;
 				textArea.ReplaceSelectionWithText(text);
 			} else {
-				int oldLength = compositionLength;
+				int oldLength;
+				if (!TryNormalizeCompositionRange(out oldLength))
+					return;
 				compositionLength = text.Length;
 				textArea.Document.Replace(compositionStartOffset, oldLength, text, OffsetChangeMappingType.CharacterReplace);
 			}
@@ -278,8 +331,14 @@ namespace ICSharpCode.AvalonEdit.Editing
 
 		void CommitDocumentComposition(string result)
 		{
+			pendingTextInputSuppression = result;
 			if (compositionStartOffset >= 0) {
-				textArea.Selection = Selection.Create(textArea, compositionStartOffset, compositionStartOffset + compositionLength);
+				int currentLength;
+				if (!TryNormalizeCompositionRange(out currentLength)) {
+					textArea.PerformTextInput(result);
+					return;
+				}
+				textArea.Selection = Selection.Create(textArea, compositionStartOffset, compositionStartOffset + currentLength);
 				ClearDocumentCompositionState();
 				textArea.PerformTextInput(result);
 				EndUndoGroup();
@@ -291,8 +350,11 @@ namespace ICSharpCode.AvalonEdit.Editing
 		void CancelDocumentComposition()
 		{
 			if (compositionStartOffset >= 0 && textArea.Document != null) {
-				textArea.Document.Remove(compositionStartOffset, compositionLength);
-				textArea.Caret.Offset = compositionStartOffset;
+				int currentLength;
+				if (TryNormalizeCompositionRange(out currentLength)) {
+					textArea.Document.Remove(compositionStartOffset, currentLength);
+					textArea.Caret.Offset = compositionStartOffset;
+				}
 			}
 			ClearDocumentCompositionState();
 			EndUndoGroup();
@@ -309,6 +371,25 @@ namespace ICSharpCode.AvalonEdit.Editing
 			compositionLayer.Clear();
 			compositionStartOffset = -1;
 			compositionLength = 0;
+		}
+
+		bool TryNormalizeCompositionRange(out int length)
+		{
+			length = 0;
+			TextDocument document = textArea.Document;
+			if (document == null || compositionStartOffset < 0)
+				return false;
+
+			int textLength = document.TextLength;
+			if (compositionStartOffset > textLength) {
+				ClearDocumentCompositionState();
+				EndUndoGroup();
+				return false;
+			}
+
+			length = Math.Max(0, Math.Min(compositionLength, textLength - compositionStartOffset));
+			compositionLength = length;
+			return true;
 		}
 
 		void StartUndoGroup()

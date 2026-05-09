@@ -886,6 +886,10 @@ namespace ICSharpCode.AvalonEdit.Editing
 			//Debug.WriteLine("TextInput: Text='" + e.Text + "' SystemText='" + e.SystemText + "' ControlText='" + e.ControlText + "'");
 			base.OnTextInput(e);
 			if (!e.Handled && this.Document != null) {
+				if (ime != null && ime.ShouldSuppressTextInput(e.Text)) {
+					e.Handled = true;
+					return;
+				}
 				if (string.IsNullOrEmpty(e.Text) || e.Text == "\x1b" || e.Text == "\b") {
 					// ASCII 0x1b = ESC.
 					// WPF produces a TextInput event with that old ASCII control char
