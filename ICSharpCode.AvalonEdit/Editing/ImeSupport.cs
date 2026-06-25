@@ -213,8 +213,12 @@ namespace ICSharpCode.AvalonEdit.Editing
 
 		bool UseInlineComposition {
 			get {
-				CultureInfo inputLanguage = InputLanguageManager.Current.CurrentInputLanguage;
-				return inputLanguage != null && string.Equals(inputLanguage.TwoLetterISOLanguageName, "ko", StringComparison.OrdinalIgnoreCase);
+				try {
+					CultureInfo inputLanguage = InputLanguageManager.Current.CurrentInputLanguage;
+					return inputLanguage != null && string.Equals(inputLanguage.TwoLetterISOLanguageName, "ko", StringComparison.OrdinalIgnoreCase);
+				} catch (CultureNotFoundException) {
+					return false;
+				}
 			}
 		}
 
